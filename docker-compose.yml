@@ -1,0 +1,81 @@
+version: "3.9"
+
+services:
+  auth:
+    build: ./auth
+    container_name: 'auth-cicd'
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./auth/.env
+    networks:
+      - cicd-network
+
+  rabbitmq:
+    image: rabbitmq:3.8-management-alpine
+    container_name: 'rabbitmq-cicd'
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq/
+      - rabbitmq_log:/var/log/rabbitmq
+    networks:
+      - cicd-network
+
+  order:
+    build: ./order
+    container_name: 'order-cicd'
+    ports:
+      - "3002:3002"
+    depends_on:
+      - rabbitmq
+    environment:
+      - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+    env_file:
+      - ./order/.env
+    networks:
+      - cicd-network
+
+  product:
+    build: ./product
+    container_name: 'product-cicd'
+    ports:
+      - "3001:3001"
+    depends_on:
+      - rabbitmq
+    environment:
+      - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+    env_file:
+      - ./product/.env
+    networks:
+      - cicd-network
+
+  api-gateway:
+    build: ./api-gateway
+    container_name: 'gateway-cicd'
+    ports:
+      - "3003:3003"
+    environment:
+      - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+    networks:
+      - cicd-network
+      
+  mongo:
+    image: mongo:6
+    container_name: 'mongodb-cicd'
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - cicd-network
+
+networks:
+  cicd-network:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  rabbitmq_data:
+  rabbitmq_log:
