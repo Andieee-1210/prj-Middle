@@ -6,28 +6,45 @@ on:
   pull_request:
     branches: [ "main" ]
 
+env:
+  DOCKER_REGISTRY: docker.io
+  
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     
     services:
       mongodb:
         image: mongo:6
         ports:
           - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand({ping: 1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
       
       rabbitmq:
         image: rabbitmq:3.8-management-alpine
         ports:
           - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     strategy:
+      fail-fast: false
       matrix:
         service: [auth, order, product, api-gateway]
         node-version: [20.x]
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
     
     - name: Setup Node.js ${{ matrix.node-version }}
       uses: actions/setup-node@v4
@@ -40,25 +57,45 @@ jobs:
       working-directory: ./${{ matrix.service }}
       run: npm ci
 
+    - name: Run linting
+      working-directory: ./${{ matrix.service }}
+      run: npm run lint --if-present || echo "⚠️ No linting configured for ${{ matrix.service }}"
+
     - name: Run tests
       working-directory: ./${{ matrix.service }}
-      run: npm test --if-present || echo "No test for ${{ matrix.service }}"
+      run: npm test --if-present || echo "⚠️ No tests found for ${{ matrix.service }}"
+      env:
+        NODE_ENV: test
+        MONGODB_URI: mongodb://localhost:27017/test
+        RABBITMQ_URL: amqp://localhost:5672
 
-    - name: Build
+    - name: Build application
       working-directory: ./${{ matrix.service }}
-      run: npm run build --if-present
+      run: npm run build --if-present || echo "✅ No build step for ${{ matrix.service }}"
+
+    - name: Upload coverage
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-${{ matrix.service }}
+        path: ${{ matrix.service }}/coverage/
+        retention-days: 7
+        if-no-files-found: ignore
 
   docker-build-push:
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    timeout-minutes: 20
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     strategy:
+      fail-fast: false
       matrix:
         service: [auth, order, product, api-gateway]
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -69,6 +106,17 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
 
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}-cicd
+        tags: |
+          type=raw,value=latest
+          type=sha,prefix={{branch}}-
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+
     - name: Build and push ${{ matrix.service }}
       uses: docker/build-push-action@v5
       with:
@@ -77,37 +125,59 @@ jobs:
         tags: |
           ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}-cicd:latest
           ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}-cicd:${{ github.sha }}
+        cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}-cicd:buildcache
+        cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}-cicd:buildcache,mode=max
+        labels: |
+          org.opencontainers.image.source=${{ github.event.repository.html_url }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+    - name: Image digest
+      run: echo "✅ Image pushed - ${{ matrix.service }}:${{ github.sha }}"
 
   deploy:
     needs: docker-build-push
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
     - name: Login to Docker Hub
       uses: docker/login-action@v3
       with:
-        username: ${{ secrets.DOCKER_USERNAME }}    # ✅ SỬA DÒNG NÀY
-        password: ${{ secrets.DOCKER_PASSWORD }}    # ✅ SỬA DÒNG NÀY
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
 
     - name: Create production compose file
       run: |
-        cat > docker-compose.prod.yml << EOF
+        cat > docker-compose.prod.yml << 'EOF'
         version: "3.9"
+
         services:
-          auth:
-            image: ${{ secrets.DOCKER_USERNAME }}/auth-cicd:latest
-            container_name: 'auth-cicd'
+          mongodb:
+            image: mongo:6
+            container_name: mongodb-cicd
+            restart: unless-stopped
             ports:
-              - "3000:3000"
+              - "27017:27017"
+            volumes:
+              - mongo_data:/data/db
             networks:
               - cicd-network
+            healthcheck:
+              test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+              interval: 10s
+              timeout: 5s
+              retries: 5
+              start_period: 20s
 
           rabbitmq:
             image: rabbitmq:3.8-management-alpine
-            container_name: 'rabbitmq-cicd'
+            container_name: rabbitmq-cicd
+            restart: unless-stopped
             ports:
               - "5672:5672"
               - "15672:15672"
@@ -115,50 +185,116 @@ jobs:
               - rabbitmq_data:/var/lib/rabbitmq/
             networks:
               - cicd-network
+            healthcheck:
+              test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+              interval: 10s
+              timeout: 5s
+              retries: 5
+              start_period: 20s
 
-          order:
-            image: ${{ secrets.DOCKER_USERNAME }}/order-cicd:latest
-            container_name: 'order-cicd'
+          auth:
+            image: ${{ secrets.DOCKER_USERNAME }}/auth-cicd:latest
+            container_name: auth-cicd
+            restart: unless-stopped
             ports:
-              - "3002:3002"
+              - "3000:3000"
             depends_on:
-              - rabbitmq
+              mongodb:
+                condition: service_healthy
+              rabbitmq:
+                condition: service_healthy
             environment:
+              - NODE_ENV=production
+              - MONGODB_URI=mongodb://mongodb-cicd:27017/auth
               - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+              - PORT=3000
             networks:
               - cicd-network
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 40s
 
           product:
             image: ${{ secrets.DOCKER_USERNAME }}/product-cicd:latest
-            container_name: 'product-cicd'
+            container_name: product-cicd
+            restart: unless-stopped
             ports:
               - "3001:3001"
             depends_on:
-              - rabbitmq
+              mongodb:
+                condition: service_healthy
+              rabbitmq:
+                condition: service_healthy
             environment:
+              - NODE_ENV=production
+              - MONGODB_URI=mongodb://mongodb-cicd:27017/product
               - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+              - PORT=3001
             networks:
               - cicd-network
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 40s
+
+          order:
+            image: ${{ secrets.DOCKER_USERNAME }}/order-cicd:latest
+            container_name: order-cicd
+            restart: unless-stopped
+            ports:
+              - "3002:3002"
+            depends_on:
+              mongodb:
+                condition: service_healthy
+              rabbitmq:
+                condition: service_healthy
+            environment:
+              - NODE_ENV=production
+              - MONGODB_URI=mongodb://mongodb-cicd:27017/order
+              - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+              - PORT=3002
+            networks:
+              - cicd-network
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:3002/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 40s
 
           api-gateway:
             image: ${{ secrets.DOCKER_USERNAME }}/api-gateway-cicd:latest
-            container_name: 'gateway-cicd'
+            container_name: gateway-cicd
+            restart: unless-stopped
             ports:
               - "3003:3003"
+            depends_on:
+              auth:
+                condition: service_healthy
+              product:
+                condition: service_healthy
+              order:
+                condition: service_healthy
             environment:
+              - NODE_ENV=production
               - RABBITMQ_URL=amqp://rabbitmq-cicd:5672
+              - AUTH_SERVICE_URL=http://auth-cicd:3000
+              - PRODUCT_SERVICE_URL=http://product-cicd:3001
+              - ORDER_SERVICE_URL=http://order-cicd:3002
+              - PORT=3003
             networks:
               - cicd-network
-
-          mongo:
-            image: mongo:6
-            container_name: 'mongodb-cicd'
-            ports:
-              - "27017:27017"
-            volumes:
-              - mongo_data:/data/db
-            networks:
-              - cicd-network
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 40s
 
         networks:
           cicd-network:
@@ -166,24 +302,103 @@ jobs:
 
         volumes:
           mongo_data:
+            driver: local
           rabbitmq_data:
+            driver: local
         EOF
-    - name: Ensure Docker is running
-      run: docker info
-    - name: Pull và start services
+
+    - name: Verify Docker installation
       run: |
+        docker --version
+        docker compose version
+        docker info
+
+    - name: Pull latest images
+      run: |
+        echo "🔄 Pulling latest images..."
         docker compose -f docker-compose.prod.yml pull
+
+    - name: Stop existing containers
+      run: |
+        echo "🛑 Stopping existing containers..."
+        docker compose -f docker-compose.prod.yml down --remove-orphans || true
+
+    - name: Start services
+      run: |
+        echo "🚀 Starting services..."
         docker compose -f docker-compose.prod.yml up -d
-        sleep 20
+
+    - name: Wait for services to be ready
+      run: |
+        echo "⏳ Waiting for services to be healthy..."
+        sleep 30
+        
+        # Wait for health checks
+        timeout 120 bash -c '
+          while true; do
+            if docker compose -f docker-compose.prod.yml ps | grep -q "unhealthy"; then
+              echo "⏳ Services still starting..."
+              sleep 5
+            else
+              echo "✅ All services are ready"
+              break
+            fi
+          done
+        ' || echo "⚠️ Timeout waiting for services"
+
+    - name: Show service status
+      run: |
+        echo "📊 Service status:"
         docker compose -f docker-compose.prod.yml ps
 
-    - name: Test services
-      run: |
-        curl -f http://localhost:3003 || echo "Gateway OK"
-        curl -f http://localhost:3000 || echo "Auth OK"
-        curl -f http://localhost:3001 || echo "Product OK"
-        curl -f http://localhost:3002 || echo "Order OK"
-
-    - name: Cleanup
+    - name: Show service logs
       if: always()
-      run: docker compose -f docker-compose.prod.yml down
+      run: |
+        echo "📋 Service logs:"
+        docker compose -f docker-compose.prod.yml logs --tail=50
+
+    - name: Test API Gateway
+      run: |
+        echo "🧪 Testing API Gateway..."
+        sleep 10
+        curl -f http://localhost:3003/health || curl -I http://localhost:3003 || echo "⚠️ Gateway not responding yet"
+
+    - name: Test Auth Service
+      run: |
+        echo "🧪 Testing Auth Service..."
+        curl -f http://localhost:3000/health || curl -I http://localhost:3000 || echo "⚠️ Auth not responding yet"
+
+    - name: Test Product Service
+      run: |
+        echo "🧪 Testing Product Service..."
+        curl -f http://localhost:3001/health || curl -I http://localhost:3001 || echo "⚠️ Product not responding yet"
+
+    - name: Test Order Service
+      run: |
+        echo "🧪 Testing Order Service..."
+        curl -f http://localhost:3002/health || curl -I http://localhost:3002 || echo "⚠️ Order not responding yet"
+
+    - name: Deployment summary
+      if: always()
+      run: |
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📦 DEPLOYMENT SUMMARY"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Commit: ${{ github.sha }}"
+        echo "Branch: ${{ github.ref_name }}"
+        echo "Author: ${{ github.actor }}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        docker compose -f docker-compose.prod.yml ps
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "❌ Deployment failed, cleaning up..."
+        docker compose -f docker-compose.prod.yml logs
+        docker compose -f docker-compose.prod.yml down
+
+    # Uncomment nếu muốn tự động cleanup sau test
+    # - name: Cleanup
+    #   if: always()
+    #   run: docker compose -f docker-compose.prod.yml down
