@@ -113,7 +113,7 @@ jobs:
               - "15672:15672"
             volumes:
               - rabbitmq_data:/var/lib/rabbitmq/
-            networks:
+networks:
               - cicd-network
 
           order:

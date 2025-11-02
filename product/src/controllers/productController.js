@@ -127,12 +127,12 @@ class ProductController {
       });
     }
   }
-  s
+  
 
 
 
 
-  // hoc thuoc them
+
   async getOrderStatus(req, res, next) {
     const {
       orderId
@@ -147,32 +147,48 @@ class ProductController {
   }
 
   // get details product
-  async getProductsDetails(req, res, next) {
-    try {
-      const {
-        id
-      } = req.params;
-      const token = req.headers.authorization;
-      if (!token) {
-        return res.status(401).json({
-          message: "Unauthorized"
-        });
-      }
-      const product = await Product.findById(id);
-      if (!product) {
-        return res.status(404).json({
-          message: "product not found"
-        });
-      }
-      return res.status(200).json(product);
-    } catch (error) {
-      console.error(error);
-      return res.status(500).json({
-        message: "sever error"
-      });
-    }
-  }
 
+async getID(req, res , next){
+  try{
+    const{id} = req.params;
+    const token = req.headers.authorization;
+    if(!token) {
+      return res.status(401).json({
+      message: "No auth"
+    });
+    }
+    const product = await Product.findById(Id);
+    if(!product) {
+      return res.status(404).json({
+      message: "Product not found"
+    });
+    }
+    return res.status(200).json(product);
+  } catch(error){
+    console.error(error);
+    return res.status(200).json({
+      message: "sever error"
+    });
+  }
+}
+
+async getID(req, res, next){
+  try{
+    const{id} = req.params;
+    const token = req.headers.authorization;
+    if(!token) {
+      return req.status(401).json({message:" auth error"});
+    }
+    const product = req.headers.authorization;
+    if(!product) {
+      return req.status(401).json({message:" product error"});
+    }
+    return req.status(200).json(product);
+  } catch(error){
+    console.error(error);
+    return req.status(200).json({message:"sever error"});
+  }
+}
   //delete all products
   async deleteAllProducts(req, res, next) {
     try {
@@ -192,24 +208,6 @@ class ProductController {
       res.status(500).json({
         message: "Server error"
       });
-    }
-  }
-  //demo
-  async getId(req, res, next ){
-    try{
-      const {id}=req.params;
-      const token=req.header.authorization;
-      if(!token){
-        return res.status(401).json({message:"not auth"});
-      }
-      const product = await Product.findById(id);
-      if(!product){
-        return res.status(404).json({message:"not product"});
-      }
-      return res.status(200).json(product);
-    }catch(error){
-      console.error(error);
-      return res.status(500).json({message:"not server"});
     }
   }
 
